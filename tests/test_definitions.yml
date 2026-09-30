@@ -1,0 +1,115 @@
+# 6 test kualitas data — T1 Kampus, slice k4 (Angkatan 2024) — UTS item 3
+# severity wajib: blocking | warning
+# expected: pass | fail   (fail = memang menangkap masalah yang terlihat di profil)
+# sql mengembalikan SATU angka: jumlah baris yang melanggar.
+#
+# Semua nilai `perkiraan_baris` DIHITUNG dari output nyata:
+#   python -m pipeline.profile --topic t1 --slice k4
+# dan diverifikasi ulang langsung dengan query yang sama persis dengan `sql` di bawah
+# (bukan tebakan — lihat transkrip profiling yang ditunjukkan ke user sebelum berkas ini ditulis).
+#
+# Catatan penting: profiler bawaan dosen (pipeline/profile.py) untuk topik t1 TIDAK memfilter ke
+# slice (query jalan atas seluruh mahasiswa.csv/presensi.csv/nilai.csv, tiga angkatan sekaligus)
+# — flag --slice k4 hanya memengaruhi label output, bukan predikat query profiling. Karena itu
+# scope test di bawah ditulis `source` (baca CSV mentah langsung, sebelum filter slice), persis
+# seperti yang dicontohkan starter. Filter ke slice k4 baru terjadi di `dim_mahasiswa`
+# ({SLICE_mahasiswa}) dan menjalar ke fact_presensi lewat INNER JOIN — lihat
+# pipeline/DESIGN_load.md.
+
+tests:
+  - name: nim_duplikat
+    topic: t1
+    severity: warning
+    scope: source
+    sql: >-
+      SELECT count(*) FROM (SELECT nim FROM raw_mahasiswa GROUP BY 1 HAVING count(*) > 1)
+    expected: pass
+    perkiraan_baris: 0
+    justifikasi: >-
+      NIM adalah natural key dim_mahasiswa (nim_nk) dan dasar surrogate key mahasiswa_sk.
+      Duplikat di sini berarti dua orang terbaca sebagai satu baris dimensi, dan seluruh
+      presensi/nilai mereka akan ter-JOIN ke mahasiswa_sk yang salah. Severity warning (bukan
+      blocking) karena hasil profiling menunjukkan 0 pelanggaran — risikonya nyata tapi belum
+      terjadi di data ini; kalau di masa depan muncul >0, tim harus tahu tanpa langsung
+      menghentikan load dimensi lain.
+
+  - name: presensi_duplikat_grain
+    topic: t1
+    severity: blocking
+    scope: source
+    sql: >-
+      SELECT count(*) FROM (SELECT nim, kode_mk, tanggal FROM raw_presensi
+      GROUP BY 1,2,3 HAVING count(*) > 1)
+    expected: fail
+    perkiraan_baris: 4344
+    justifikasi: >-
+      Grain fact_presensi = satu baris per (nim, kode_mk, tanggal). 4.344 baris sumber melanggar
+      grain ini (dihitung ulang dan cocok dengan output pipeline.profile). Test ini DIHARAPKAN
+      FAIL pada data mentah — itu yang membenarkan langkah dedup ROW_NUMBER() PARTITION BY
+      (nim, kode_mk, tanggal) di sql/30_fact_presensi.sql. Blocking karena tanpa dedup, fact akan
+      menggandakan kehadiran (SUM(is_hadir) jadi terlalu tinggi untuk pasangan yang kembar).
+
+  - name: tanggal_presensi_format_lain
+    topic: t1
+    severity: blocking
+    scope: source
+    sql: >-
+      SELECT count(*) FROM raw_presensi WHERE tanggal LIKE '__/__/____'
+    expected: fail
+    perkiraan_baris: 5812
+    justifikasi: >-
+      5.812 baris berformat dd/mm/yyyy, tidak bisa di-CAST langsung ke DATE ISO — kalau
+      dibiarkan lewat TRY_CAST polos, semuanya jadi NULL dan baris itu gagal join ke dim_date
+      (jatuh ke date_sk=-1 "TIDAK DIKETAHUI"), padahal datanya valid dan bisa diselamatkan.
+      Blocking karena ini alasan sql/30_fact_presensi.sql WAJIB punya cabang parsing eksplisit
+      (strptime '%d/%m/%Y') sebelum fact dianggap siap dimuat.
+
+  - name: nilai_di_luar_rentang
+    topic: t1
+    severity: blocking
+    scope: source
+    sql: >-
+      SELECT count(*) FROM raw_nilai
+      WHERE TRY_CAST(nilai_angka AS INT) > 100 OR TRY_CAST(nilai_angka AS INT) < 0
+    expected: fail
+    perkiraan_baris: 2
+    justifikasi: >-
+      2 baris nilai_angka di luar rentang 0-100 (mis. 117, -5) — bukan nilai yang mungkin secara
+      akademik. Test ini tetap didaftarkan meski nilai.csv sengaja TIDAK dimuat ke fact_presensi
+      pada desain ini (lihat docs/BATAS_DESAIN.md); severity blocking karena kalau suatu saat
+      fact nilai dibangun, dua baris ini harus ditolak/dikarantina, bukan ikut merusak rata-rata
+      nilai per mata kuliah.
+
+  - name: status_presensi_di_luar_domain
+    topic: t1
+    severity: warning
+    scope: source
+    sql: >-
+      SELECT count(*) FROM raw_presensi
+      WHERE upper(trim(status)) NOT IN ('HADIR','H','IZIN','SAKIT','ALPA')
+    expected: fail
+    perkiraan_baris: 11819
+    justifikasi: >-
+      Setelah dinormalisasi upper/trim, 5 dari 10 varian mentah (HADIR/hadir, H, IZIN/izin,
+      SAKIT/sakit, ALPA/alpa) sudah tertangkap sebagai valid; sisa 11.819 baris adalah tanda '-'
+      (status tidak terbaca dari sumber). Ini persis populasi yang dipetakan ke
+      dim_status_kehadiran.kode_status = 'TIDAK_DIKETAHUI' di fact. Warning (bukan blocking)
+      karena baris ini tetap bisa dimuat dengan makna eksplisit "tidak diketahui", tidak perlu
+      menghentikan seluruh load — cukup dipantau kalau proporsinya naik dari run ke run.
+
+  - name: mahasiswa_angkatan_kosong
+    topic: t1
+    severity: blocking
+    scope: source
+    sql: >-
+      SELECT count(*) FROM raw_mahasiswa WHERE angkatan IS NULL OR angkatan = ''
+    expected: fail
+    perkiraan_baris: 62
+    justifikasi: >-
+      62 baris mahasiswa tanpa angkatan. Slice tim (k4) didefinisikan sebagai `angkatan='2024'`
+      di pipeline/config.py — baris tanpa angkatan otomatis TIDAK PERNAH masuk slice mana pun
+      (bukan hanya k4), sehingga mahasiswa itu tidak akan pernah muncul di dim_mahasiswa maupun
+      fact_presensi tim manapun. Blocking karena ini menandakan kegagalan pada sumber yang harus
+      diperbaiki di hulu (BAAK), bukan sesuatu yang bisa didiamkan sebagai "Unknown" — anggota
+      Unknown (mahasiswa_sk=-1) di desain ini untuk FK yang gagal join, bukan untuk data sumber
+      yang memang tidak lengkap.
